@@ -1,18 +1,11 @@
-
-# radiology_preference_app_4tabs_secure.py
+# radiology_preference_app_4tabs.py
 # Streamlit app for blinded A/B preference of radiology report impressions (AI vs Human)
 # Four GUIs together (CT Head, CTPE, Ultrasound, General) as separate tabs,
-# each with its own sequential case order & independent progress pointer, sharing ONE SQLite DB.
-#
-# CHANGES per request:
-# - ✅ Add password login (Streamlit Authenticator) following your existing pattern.
-# - ✅ Remove random seed and "cases per dataset" from UI.
-# - ✅ Present cases in a fixed, sequential order (first row -> last row) for everyone.
-# - ✅ Keep A/B blinding with deterministic mapping (no seed input; stable across users).
+# each with its own randomized case order & progress pointer, sharing ONE SQLite DB.
 #
 # How to run:
-#   pip install streamlit pandas streamlit-authenticator pyyaml
-#   streamlit run radiology_preference_app_4tabs_secure.py
+#   pip install streamlit pandas
+#   streamlit run radiology_preference_app_4tabs.py
 #
 # CSVs expected in the working directory (or adjust paths in the sidebar):
 #   enhanced_top_CTHead_generated_impressions.csv
@@ -26,8 +19,7 @@
 #   model_name, reward, mean_f1_score
 #
 # Blinding rules:
-# - A/B order is deterministic per dataset & case (via hash) to preserve blinding
-#   with stability across users/sessions—no UI seed.
+# - A/B order is randomized per dataset & case using a deterministic seed.
 # - Admin-only "Reveal mapping" checkbox can show which side is AI after choices are stored.
 
 import os
@@ -36,31 +28,12 @@ import random
 import sqlite3
 from datetime import datetime
 import re
-from typing import Optional
+from typing import Dict, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
 
-# --- Authentication libs (match your attached code's approach) ---
-
-import streamlit as st
-import os
-import json
-import uuid
-import random
-import pandas as pd
-import sqlite3
-import logging
-from datetime import datetime
-import time
-import re  # For extracting folder names
-
-import streamlit_authenticator as stauth
-import yaml
-from yaml.loader import SafeLoader
-from streamlit_authenticator.utilities.hasher import Hasher
-
-APP_TITLE = "Blinded A/B Preference: Radiology Impressions"
+APP_TITLE = "Blinded A/B Preference: Radiology Impressions (4-in-1)"
 DB_PATH_DEFAULT = "preferences.db"
 
 # ---------- Cleaning trailing non-technical text ----------
@@ -144,63 +117,19 @@ def export_ratings(db_path: str) -> pd.DataFrame:
     with sqlite3.connect(db_path) as conn:
         return pd.read_sql_query("SELECT * FROM ratings ORDER BY id ASC", conn)
 
-# ---------- Authentication (matches your attached script style) ----------
-
-def setup_authentication():
-    """
-    Uses streamlit-authenticator with a YAML config file (config.yaml).
-    If config.yaml doesn't exist, create a default one with 20 demo testers:
-      - usernames: tester1..tester20
-      - passwords: pass1..pass20 (hashed in config)
-    You can replace config.yaml with your real credential set later.
-    """
-    try:
-        if not os.path.exists("config.yaml"):
-            plain_passwords = [f"pass{i+1}" for i in range(20)]
-            hashed_passwords = Hasher(plain_passwords).generate()
-            credentials_dict = {}
-            for i in range(20):
-                username = f"tester{i+1}"
-                credentials_dict[username] = {
-                    "email": f"{username}@example.com",
-                    "name": f"Test User {i+1}",
-                    "password": hashed_passwords[i],
-                }
-            config = {
-                "credentials": {"usernames": credentials_dict},
-                "cookie": {"expiry_days": 180, "key": "your_cookie_key", "name": "auth_cookie"},
-                "preauthorized": [],
-            }
-            with open("config.yaml", "w") as f:
-                yaml.dump(config, f)
-
-        with open("config.yaml", "r", encoding="utf-8") as f:
-            config = yaml.load(f, Loader=SafeLoader)
-
-        return stauth.Authenticate(
-            credentials=config["credentials"],
-            cookie_name=config["cookie"]["name"],
-            key=config["cookie"]["key"],
-            cookie_expiry_days=config["cookie"]["expiry_days"],
-            preauthorized=config.get("preauthorized", []),
-        )
-    except Exception as e:
-        st.error(f"Authentication setup failed: {str(e)}")
-        st.stop()
-
 # ---------- Helpers ----------
 
 def text_hash(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
 
-def deterministic_ai_is_a(dataset_name: str, case_index: int) -> bool:
-    """
-    Deterministic A/B mapping, no UI seed needed.
-    Stable across users/sessions; preserves blinding (identity hidden).
-    """
-    seed_src = f"{dataset_name}|{case_index}|abmap_v1"
-    seed_int = int(hashlib.sha256(seed_src.encode("utf-8")).hexdigest()[:8], 16)
-    rng = random.Random(seed_int ^ 0x9E3779B1)  # mix with a constant for dispersion
+def dataset_salt(dataset_name: str) -> int:
+    # Derive a small integer salt from dataset name for per-dataset randomization
+    h = hashlib.sha256(dataset_name.encode("utf-8")).hexdigest()[:8]
+    return int(h, 16) & 0x7FFFFFFF
+
+def ab_mapping_for_case(base_seed: int, dataset_name: str, case_index: int) -> bool:
+    """True if AI should be A, else False (AI is B)."""
+    rng = random.Random(base_seed + dataset_salt(dataset_name) + case_index * 7919)
     return rng.random() < 0.5
 
 def load_dataset(path: str) -> pd.DataFrame:
@@ -217,23 +146,27 @@ def load_dataset(path: str) -> pd.DataFrame:
     df.reset_index(drop=True, inplace=True)
     return df
 
+def make_case_order(n: int, seed: int, dataset_name: str) -> list:
+    order = list(range(n))
+    rng = random.Random(seed + dataset_salt(dataset_name))
+    rng.shuffle(order)
+    return order
+
 # ---------- Streamlit UI ----------
 
 def ui_header():
     st.title(APP_TITLE)
     st.caption(
-        "Evaluate **four datasets** via tabs. Each tab shows clinical **Findings** and two blinded "
-        "**Impressions (A & B)**—one human (`reference_impression`) and one AI (`generated_impression`). "
-        "Choose which impression you prefer for each case."
+        "Evaluate **four datasets** side-by-side (tabs). Each tab presents clinical **Findings** and two blinded **Impressions (A & B)**—"
+        "one human (`reference_impression`) and one AI (`generated_impression`). Choose which impression you prefer for each case."
     )
 
-def ui_sidebar(auth_user: Optional[str]):
+def ui_sidebar():
     st.sidebar.header("Global Setup")
-
-    # Rater ID defaults to authenticated username; user can override if desired.
-    rater_id = st.sidebar.text_input("Your User ID (required)", value=(auth_user or ""))
-
+    rater_id = st.sidebar.text_input("Your rater ID (required)", value="")
     db_path = st.sidebar.text_input("SQLite DB path", value=DB_PATH_DEFAULT)
+    base_seed = st.sidebar.number_input("Randomization seed", min_value=0, value=42, step=1)
+    n_cases = st.sidebar.number_input("Cases per dataset", min_value=1, value=10, step=1)
 
     st.sidebar.divider()
     st.sidebar.subheader("Data files")
@@ -254,6 +187,8 @@ def ui_sidebar(auth_user: Optional[str]):
     return dict(
         rater_id=rater_id.strip(),
         db_path=db_path.strip(),
+        base_seed=int(base_seed),
+        n_cases=int(n_cases),
         paths=paths,
         start_all=start_all,
         reveal=reveal,
@@ -261,12 +196,12 @@ def ui_sidebar(auth_user: Optional[str]):
 
 def init_session_state():
     if "datasets_state" not in st.session_state:
-        st.session_state.datasets_state = {}  # per dataset: {df, order (sequential), ptr}
+        st.session_state.datasets_state = {}  # per dataset: {df, order, ptr}
 
-def init_dataset_state(dataset_name: str, df: pd.DataFrame):
-    # Sequential order from first to last for everyone.
-    order = list(range(len(df)))
-    st.session_state.datasets_state[dataset_name] = {
+def init_dataset_state(dataset_name: str, df: pd.DataFrame, n_cases: int, base_seed: int):
+    dkey = dataset_name
+    order = make_case_order(len(df), base_seed, dataset_name)[: min(n_cases, len(df))]
+    st.session_state.datasets_state[dkey] = {
         "df": df,
         "order": order,
         "ptr": 0,
@@ -279,9 +214,10 @@ def get_dataset_state(dataset_name: str):
 def ensure_dataset_loaded(cfg, dataset_name: str):
     state = get_dataset_state(dataset_name)
     if state is None:
+        # Try to load lazily
         path = cfg["paths"][dataset_name]
         df = load_dataset(path)
-        init_dataset_state(dataset_name, df)
+        init_dataset_state(dataset_name, df, cfg["n_cases"], cfg["base_seed"])
 
 def preview(txt: str, n=300) -> str:
     s = (txt or "").strip()
@@ -313,21 +249,21 @@ def render_dataset_tab(cfg, dataset_name: str):
     # Reset this dataset
     with cols_top[3]:
         if st.button(f"Reset {dataset_name}", key=f"reset_{dataset_name}"):
-            init_dataset_state(dataset_name, df)
+            init_dataset_state(dataset_name, df, cfg["n_cases"], cfg["base_seed"])
             st.success("Reset complete.")
             state = get_dataset_state(dataset_name)
             order = state["order"]
             ptr = state["ptr"]
 
     if not order:
-        st.warning("No cases available in this dataset.")
+        st.warning("No cases selected for this dataset. Increase 'Cases per dataset' and click 'Start / Reset ALL datasets'.")
         return
 
     case_index = order[ptr]
     row = df.iloc[case_index].to_dict()
 
-    # A/B mapping (deterministic, no seed UI)
-    ai_is_a = deterministic_ai_is_a(dataset_name, case_index)
+    # A/B mapping
+    ai_is_a = ab_mapping_for_case(cfg["base_seed"], dataset_name, case_index)
 
     ref = row.get("reference_impression_clean", "")
     gen = row.get("generated_impression_clean", "")
@@ -366,7 +302,7 @@ def render_dataset_tab(cfg, dataset_name: str):
 
     if submitted:
         if not cfg["rater_id"]:
-            st.error("Enter your User ID in the sidebar first.")
+            st.error("Enter your rater ID in the sidebar first.")
         else:
             db_row = dict(
                 ts_utc=datetime.utcnow().isoformat(timespec="seconds").replace("+00:00","Z"),
@@ -389,7 +325,7 @@ def render_dataset_tab(cfg, dataset_name: str):
             try:
                 init_db(cfg["db_path"])
                 save_rating(cfg["db_path"], db_row)
-                # advance pointer (sequential)
+                # advance pointer
                 if state["ptr"] < len(order) - 1:
                     state["ptr"] += 1
                 st.success("Saved.")
@@ -408,27 +344,11 @@ def render_dataset_tab(cfg, dataset_name: str):
             state["ptr"] = min(len(order) - 1, state["ptr"] + 1)
 
 def main():
-    # --- Auth barrier (matches your attached pattern) ---
-    authenticator = setup_authentication()
-    authenticator.login(location="sidebar", key="login")
-    authentication_status = st.session_state.get("authentication_status", None)
-    username = st.session_state.get("username", None)
-
-    if authentication_status:
-        authenticator.logout("Logout", "sidebar", key="logout_button")
-    else:
-        if authentication_status is False:
-            st.error("❌ Username/password is incorrect")
-        else:
-            st.warning("⚠️ Please enter your username and password")
-        st.stop()
-
-    # --- App proper ---
     ui_header()
-    cfg = ui_sidebar(auth_user=username)
+    cfg = ui_sidebar()
     init_session_state()
 
-    # Initialize DB early so export works even before first save
+    # Initialize DB once early (if possible) so export works even before first save
     try:
         if cfg["db_path"]:
             init_db(cfg["db_path"])
@@ -442,7 +362,7 @@ def main():
         for name, path in cfg["paths"].items():
             try:
                 df = load_dataset(path)
-                init_dataset_state(name, df)
+                init_dataset_state(name, df, cfg["n_cases"], cfg["base_seed"])
             except Exception as e:
                 st.warning(f"{name}: {e}")
         st.success("All datasets initialized.")
@@ -469,7 +389,7 @@ def main():
         except Exception as e:
             st.error(f"Export failed: {e}")
 
-    st.caption("Note: Each tab is an independent GUI with its own sequential case order and progress. "
+    st.caption("Note: Each tab is an independent GUI with its own randomized case order and progress. "
                "All ratings go to the same SQLite database for unified analysis.")
 
 if __name__ == "__main__":

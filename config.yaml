@@ -1,0 +1,90 @@
+credentials:
+  usernames:
+    tester1:
+      email: tester1@example.com
+      name: Test User One
+      password: "password1" # Replace with a secure password
+    tester2:
+      email: tester2@example.com
+      name: Test User Two
+      password: "password2" # Replace with a secure password
+    tester3:
+      email: tester3@example.com
+      name: Test User Three
+      password: "password3" # Replace with a secure password
+    tester4:
+      email: tester4@example.com
+      name: Test User Four
+      password: "password4" # Replace with a secure password
+    tester5:
+      email: tester5@example.com
+      name: Test User Five
+      password: "password5" # Replace with a secure password
+    tester6:
+      email: tester6@example.com
+      name: Test User Six
+      password: "password6" # Replace with a secure password
+    tester7:
+      email: tester7@example.com
+      name: Test User Seven
+      password: "password7" # Replace with a secure password
+    tester8:
+      email: tester8@example.com
+      name: Test User Eight
+      password: "password8" # Replace with a secure password
+    tester9:
+      email: tester9@example.com
+      name: Test User Nine
+      password: "password9" # Replace with a secure password
+    tester10:
+      email: tester10@example.com
+      name: Test User Ten
+      password: "password10" # Replace with a secure password
+    tester11:
+      email: tester11@example.com
+      name: Test User Eleven
+      password: "password11" # Replace with a secure password
+    tester12:
+      email: tester12@example.com
+      name: Test User Twelve
+      password: "password12" # Replace with a secure password
+    tester13:
+      email: tester13@example.com
+      name: Test User Thirteen
+      password: "password13" # Replace with a secure password
+    tester14:
+      email: tester14@example.com
+      name: Test User Fourteen
+      password: "password14" # Replace with a secure password
+    tester15:
+      email: tester15example.com
+      name: Test User Fifteen
+      password: "password15" # Replace with a secure password
+    tester16:
+      email: tester16@example.com
+      name: Test User Sixteen
+      password: "password16" # Replace with a secure password
+    tester17:
+      email: tester17@example.com
+      name: Test User Seventeen
+      password: "password17" # Replace with a secure password
+    tester18:
+      email: tester18@example.com
+      name: Test User Eighteen
+      password: "password18" # Replace with a secure password
+    tester19:
+      email: tester19@example.com
+      name: Test User Nineteen
+      password: "password19" # Replace with a secure password
+    tester20:
+      email: tester20@example.com
+      name: Test User Twenty
+      password: "password20" # Replace with a secure password
+cookie:
+  expiry_days: 180
+  key: "a_very_secret_key_please_change_it" # IMPORTANT: Change this to a random secret key
+  name: "survey_app_cookie"
+preauthorized: # Optional: Add emails of users who can register if registration is enabled (not in current script)
+  emails:
+    - tester1@example.com
+    - tester2@example.com
