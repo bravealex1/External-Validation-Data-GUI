@@ -166,7 +166,7 @@ def ui_sidebar():
     rater_id = st.sidebar.text_input("Your rater ID (required)", value="")
     db_path = st.sidebar.text_input("SQLite DB path", value=DB_PATH_DEFAULT)
     base_seed = st.sidebar.number_input("Randomization seed", min_value=0, value=42, step=1)
-    n_cases = st.sidebar.number_input("Cases per dataset", min_value=1, value=10, step=1)
+    n_cases = st.sidebar.number_input("Cases per dataset", min_value=1, value=30, step=1)
 
     st.sidebar.divider()
     st.sidebar.subheader("Data files")
