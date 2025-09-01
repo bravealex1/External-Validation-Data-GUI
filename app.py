@@ -33,7 +33,7 @@ from typing import Dict, Tuple, Optional
 import pandas as pd
 import streamlit as st
 
-APP_TITLE = "Blinded A/B Preference: Radiology Impressions (4-in-1)"
+APP_TITLE = "Blinded A/B Preference: Radiology Impressions"
 DB_PATH_DEFAULT = "preferences.db"
 
 # ---------- Cleaning trailing non-technical text ----------
@@ -163,9 +163,9 @@ def ui_header():
 
 def ui_sidebar():
     st.sidebar.header("Global Setup")
-    rater_id = st.sidebar.text_input("Your rater ID (required)", value="")
+    rater_id = st.sidebar.text_input("Your User ID (required)", value="")
     db_path = st.sidebar.text_input("SQLite DB path", value=DB_PATH_DEFAULT)
-    base_seed = st.sidebar.number_input("Randomization seed", min_value=0, value=42, step=1)
+    # base_seed = st.sidebar.number_input("Randomization seed", min_value=0, value=42, step=1)
     n_cases = st.sidebar.number_input("Cases per dataset", min_value=1, value=30, step=1)
 
     st.sidebar.divider()
