@@ -3,11 +3,10 @@
 # Four GUIs together (CT Head, CTPE, Ultrasound, General) as separate tabs,
 # each with its own sequential case order & independent progress pointer, sharing ONE SQLite DB.
 #
-# CHANGES for this revision (per request):
-# - ✅ Selections (A/B/Tie/Skip) no longer advance automatically.
-# - ✅ "Next" button now performs the rollover to the next case.
-# - ✅ On "Next", if a selection is pending, it is saved; otherwise, we just advance (no save).
-# - ⚠️ Everything else preserved (auth, cleaning/debiasing, DB schema, tabs, etc.).
+# CHANGES for this revision:
+# - ✅ Voting buttons (A/B/Tie/Skip) now SAVE ONLY and DO NOT advance.
+# - ✅ User must click "Next ➡️" to move to the next case.
+# - ✅ Everything else remains the same (deterministic A/B, debiasing scrubber, auth, DB, etc.).
 #
 # How to run:
 #   pip install streamlit pandas streamlit-authenticator pyyaml
@@ -254,37 +253,13 @@ def load_dataset(path: str) -> pd.DataFrame:
     ].reset_index(drop=True)
     return df
 
-def preview(txt: str, n=300) -> str:
-    s = (txt or "").strip()
-    return s[:n] + ("..." if len(s) > n else "")
-
-def build_db_row(cfg, dataset_name, case_index, ai_is_a, choice, findings, ref, gen, row):
-    return dict(
-        ts_utc=datetime.utcnow().isoformat(timespec="seconds").replace("+00:00","Z"),
-        rater_id=cfg["rater_id"],
-        dataset=dataset_name,
-        case_index=int(case_index),
-        ai_is_a=1 if ai_is_a else 0,
-        choice=choice,
-        findings_hash=text_hash(str(findings)),
-        ref_hash=text_hash(ref),
-        gen_hash=text_hash(gen),
-        ref_model="",  # human reference
-        gen_model=row.get("model_name", ""),
-        reward=float(row["reward"]) if "reward" in row and pd.notna(row["reward"]) else None,
-        mean_f1=float(row["mean_f1_score"]) if "mean_f1_score" in row and pd.notna(row["mean_f1_score"]) else None,
-        findings_preview=preview(findings),
-        a_preview=preview(gen if ai_is_a else ref),
-        b_preview=preview(ref if ai_is_a else gen),
-    )
-
 # ---------- Streamlit UI ----------
 
 def ui_header():
     st.title(APP_TITLE)
     st.caption(
         "Evaluate **four datasets** via tabs. Each tab shows clinical **Findings** and two blinded "
-        "**Impressions (A & B)**—one human and one AI. Select a choice, then click **Next** to advance."
+        "**Impressions (A & B)**—one human and one AI. Click a choice to save, then press **Next ➡️** to move on."
     )
 
 def ui_sidebar(auth_user: Optional[str]):
@@ -343,8 +318,39 @@ def ensure_dataset_loaded(cfg, dataset_name: str):
         df = load_dataset(path)
         init_dataset_state(dataset_name, df)
 
-def selection_key(dataset_name: str, case_index: int) -> str:
-    return f"pending_choice_{dataset_name}_{case_index}"
+def preview(txt: str, n=300) -> str:
+    s = (txt or "").strip()
+    return s[:n] + ("..." if len(s) > n else "")
+
+def record_choice(cfg, dataset_name, case_index, ai_is_a, choice, findings, ref, gen, row, state):
+    """Save the rating ONLY. Do NOT advance pointer; user must press Next."""
+    if not cfg["rater_id"]:
+        st.error("Enter your User ID in the sidebar first.")
+        return
+    db_row = dict(
+        ts_utc=datetime.utcnow().isoformat(timespec="seconds").replace("+00:00","Z"),
+        rater_id=cfg["rater_id"],
+        dataset=dataset_name,
+        case_index=int(case_index),
+        ai_is_a=1 if ai_is_a else 0,
+        choice=choice,
+        findings_hash=text_hash(str(findings)),
+        ref_hash=text_hash(ref),
+        gen_hash=text_hash(gen),
+        ref_model="",  # human reference
+        gen_model=row.get("model_name", ""),
+        reward=float(row["reward"]) if "reward" in row and pd.notna(row["reward"]) else None,
+        mean_f1=float(row["mean_f1_score"]) if "mean_f1_score" in row and pd.notna(row["mean_f1_score"]) else None,
+        findings_preview=preview(findings),
+        a_preview=preview(gen if ai_is_a else ref),
+        b_preview=preview(ref if ai_is_a else gen),
+    )
+    try:
+        init_db(cfg["db_path"])
+        save_rating(cfg["db_path"], db_row)
+        st.success(f"Saved: {choice}. Press **Next ➡️** to continue.")
+    except Exception as e:
+        st.error(f"Failed to save rating: {e}")
 
 def render_dataset_tab(cfg, dataset_name: str):
     st.subheader(f"{dataset_name}")
@@ -402,7 +408,6 @@ def render_dataset_tab(cfg, dataset_name: str):
     colA, colB = st.columns(2, gap="large")
     with colA:
         st.markdown("**Impression A**")
-        # Read-only display (disabled widget). Streamlit reruns on any widget change; disabled prevents edits.
         st.text_area(" ", A_text, height=260, label_visibility="collapsed",
                      key=f"{dataset_name}_A_{case_index}", disabled=True)
     with colB:
@@ -413,62 +418,39 @@ def render_dataset_tab(cfg, dataset_name: str):
     if cfg["reveal"]:
         st.info(f"Admin view: In **{dataset_name}**, AI is shown as: **{'A' if ai_is_a else 'B'}**.")
 
-    # --- Choice selection (no auto-advance, no save yet) ---
-    st.write("#### Choose your preference (selection is saved when you click **Next**)")
-    choice_key = selection_key(dataset_name, case_index)
-    if choice_key not in st.session_state:
-        st.session_state[choice_key] = None
-
+    # --- Voting buttons: SAVE ONLY (no advance) ---
+    st.write("#### Choose your preference")
     btn_cols = st.columns([1,1,1,1])
-    if btn_cols[0].button("A is better", key=f"btnA_{dataset_name}_{case_index}"):
-        st.session_state[choice_key] = "A"
-        st.info("Selected: A")
-    if btn_cols[1].button("B is better", key=f"btnB_{dataset_name}_{case_index}"):
-        st.session_state[choice_key] = "B"
-        st.info("Selected: B")
-    if btn_cols[2].button("Tie / No preference", key=f"btnT_{dataset_name}_{case_index}"):
-        st.session_state[choice_key] = "Tie"
-        st.info("Selected: Tie / No preference")
-    if btn_cols[3].button("Skip", key=f"btnS_{dataset_name}_{case_index}"):
-        st.session_state[choice_key] = "Skip"
-        st.info("Selected: Skip")
+    choice_pressed = None
+    with btn_cols[0]:
+        if st.button("A is better", key=f"btnA_{dataset_name}_{case_index}"):
+            choice_pressed = "A"
+    with btn_cols[1]:
+        if st.button("B is better", key=f"btnB_{dataset_name}_{case_index}"):
+            choice_pressed = "B"
+    with btn_cols[2]:
+        if st.button("Tie / No preference", key=f"btnT_{dataset_name}_{case_index}"):
+            choice_pressed = "Tie"
+    with btn_cols[3]:
+        if st.button("Skip", key=f"btnS_{dataset_name}_{case_index}"):
+            choice_pressed = "Skip"
 
-    # Show current pending selection
-    current_sel = st.session_state.get(choice_key)
-    st.caption(f"Pending selection: {current_sel if current_sel else 'None'}")
+    if choice_pressed is not None:
+        record_choice(
+            cfg, dataset_name, case_index, ai_is_a,
+            choice_pressed, findings, ref, gen, row, state
+        )
 
-    # Navigation: Previous / Progress / Next (Next saves if selection exists, then advances)
+    # Navigation: Previous / Progress / Next (Next advances pointer)
     nav1, prog, nav2 = st.columns([1,6,1])
     with nav1:
         if st.button("⬅️ Previous", disabled=(state["ptr"] == 0), key=f"prev_{dataset_name}"):
             state["ptr"] = max(0, state["ptr"] - 1)
-
     with prog:
         st.progress((state["ptr"] + 1) / max(1, len(order)))
-
     with nav2:
-        if st.button("Next ➡️", disabled=(state["ptr"] >= len(order) - 1), key=f"next_{dataset_name}_{case_index}"):
-            # Save pending selection if present
-            pending = st.session_state.get(choice_key, None)
-            if pending is not None and cfg["rater_id"]:
-                try:
-                    init_db(cfg["db_path"])
-                    db_row = build_db_row(
-                        cfg, dataset_name, case_index, ai_is_a, pending,
-                        findings, ref, gen, row
-                    )
-                    save_rating(cfg["db_path"], db_row)
-                    st.success(f"Saved: {pending}.")
-                except Exception as e:
-                    st.error(f"Failed to save rating: {e}")
-            elif pending is not None and not cfg["rater_id"]:
-                st.warning("Enter your User ID in the sidebar to save ratings. Advancing without save.")
-            # Clear pending selection for this case (optional)
-            if choice_key in st.session_state:
-                del st.session_state[choice_key]
-            # Advance pointer
-            if state["ptr"] < len(order) - 1:
-                state["ptr"] += 1
+        if st.button("Next ➡️", disabled=(state["ptr"] >= len(order) - 1), key=f"next_{dataset_name}"):
+            state["ptr"] = min(len(order) - 1, state["ptr"] + 1)
 
 def main():
     # --- Auth barrier ---
