@@ -398,10 +398,10 @@ def _on_choice_change(dataset_name: str, case_index: int, choice_key: str, cfg: 
             if state["ptr"] < len(state["order"]) - 1:
                 state["ptr"] += 1
                 st.toast("✅ Answer saved — moving to next case…")
-                st.experimental_rerun()
+                st.rerun()
             else:
                 state["last_saved_msg"] = "✅ Answer saved — end of dataset."
-                st.experimental_rerun()
+                st.rerun()
     except Exception as e:
         st.toast(f"Failed to save rating: {e}", icon="❌")
 
