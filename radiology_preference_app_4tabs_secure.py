@@ -3,10 +3,13 @@
 # Four GUIs together (CT Head, CTPE, Ultrasound, General) as separate tabs,
 # each with its own sequential case order & independent progress pointer, sharing ONE SQLite DB.
 #
-# CHANGES for this revision:
-# - ✅ Voting buttons (A/B/Tie/Skip) now SAVE ONLY and DO NOT advance.
-# - ✅ User must click "Next ➡️" to move to the next case.
-# - ✅ Everything else remains the same (deterministic A/B, debiasing scrubber, auth, DB, etc.).
+# CHANGES per request (2025-09-05):
+# - Single-click save: selecting A/B/Tie/Skip immediately saves (UPSERT) to SQLite.
+#   Users then press "Next" to go to the next case. No more double-click flow.
+# - "Next" is disabled until an answer exists for the current case.
+# - Removed biasing cues in impressions: numbering (1., 1), (1), i., a), etc.;
+#   "Impression:" headers; and lines indicating critical/urgent notifications or communications.
+# - Read-only impression boxes (disabled text areas) to avoid accidental edits.
 #
 # How to run:
 #   pip install streamlit pandas streamlit-authenticator pyyaml
@@ -39,11 +42,11 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-# --- Authentication libs ---
 import json
 import uuid
 import logging
 import time
+
 import streamlit_authenticator as stauth
 import yaml
 from yaml.loader import SafeLoader
@@ -52,68 +55,74 @@ from streamlit_authenticator.utilities.hasher import Hasher
 APP_TITLE = "Blinded A/B Preference: Radiology Impressions"
 DB_PATH_DEFAULT = "preferences.db"
 
-# ---------- Cleaning / Debiasing ----------
+# ---------- Bias & trailing cleanup ----------
 
-# Strip trailing boilerplate
+# Remove lines anywhere in the impression that can bias evaluators
+# (e.g., "CRITICAL FINDING", "results communicated to ...", "paged", etc.)
+CRITICAL_LINE_PATTERNS = [
+    r'(?im)^\s*(?:critical|urgent|stat|important)\s+(?:result|finding|communication)s?.*$',
+    r'(?im)^\s*(?:results|finding)s?\s+(?:were\s+)?(?:communicated|relayed|reported)\b.*$',
+    r'(?im)^\s*(?:discussed|notified|called|paged)\b.*$',
+    r'(?im)^\s*ACR\s+critical\s+results?.*$',
+]
+
+# Remove leading numbering from each line: "1. ", "(1) ", "1) ", "i) ", "a) ", etc.
+LEADING_NUMBERING_PATTERNS = [
+    r'(?im)^\s*\(?\d+\)?[.)-]\s+',           # 1.  1)  (1)  1-
+    r'(?im)^\s*[ivxlcdmIVXLCDM]+\)\s+',      # i) ii) IV)
+    r'(?im)^\s*[a-zA-Z]\)\s+',               # a) b) A)
+]
+
 TRAILING_PATTERNS = [
-    r'(?i)\bimages?\s*(?:and|&)\s*interpretations?\b.*$',
-    r'(?i)\bplease\s+see\s+images?\b.*$',
-    r'(?i)\bcorrelate\s+clinically\b.*$',
-    r'(?i)\bcontact\s+radiology\b.*$',
-    r'(?i)\bthis\s+report\b.*?(?:contact|call|page).*$',  # "This report ... contact ..."
-    r'(?i)\bfindings\s+and\s+interpretations?\b.*$',
+    r'(?is)\bimages?\s*(?:and|&)\s*interpretations?\b.*$',
+    r'(?is)\bplease\s+see\s+images?\b.*$',
+    r'(?is)\bcorrelate\s+clinically\b.*$',
+    r'(?is)\bcontact\s+radiology\b.*$',
+    r'(?is)\bthis\s+report\b.*?(?:contact|call|page).*$',  # "This report ... contact ..."
+    r'(?is)\bfindings\s+and\s+interpretations?\b.*$',
 ]
+
 TRAILING_REGEXES = [re.compile(p, re.DOTALL) for p in TRAILING_PATTERNS]
+CRITICAL_LINE_REGEXES = [re.compile(p) for p in CRITICAL_LINE_PATTERNS]
+LEADING_NUMBERING_REGEXES = [re.compile(p) for p in LEADING_NUMBERING_PATTERNS]
 
-# Remove numbered/bulleted prefixes at line starts, e.g., "1. ", "2) ", "(3) ", "• ", "-", "a) ", "i."
-LIST_PREFIX_RE = re.compile(
-    r'(?im)^\s*(?:\(?\d+\)?[.)]|[ivxlcdm]+[.)]|[a-zA-Z][.)]|[-–—*•])\s+'
-)
+IMPRESSION_HEADER_RX = re.compile(r'(?im)^\s*impression\s*:?\s*', re.MULTILINE)
 
-# Lines that can unblind/bias (critical alerts, escalation/communication meta, signatures, headings)
-BIAS_LINE_PATTERNS = [
-    r'(?im)^\s*(critical|urgent|important|significant)\s+(?:result|results|finding|findings|value|values|alert|notification|communication)\b.*$',
-    r'(?im)^\s*(communication|contact|call|page|pager|phone)\s*[:].*$',
-    r'(?im)^\s*(dictated by|signed by|attending|resident|fellow|radiologist)\b.*$',
-    r'(?im)^\s*impression\s*[:\-]\s*$',
-    r'(?im)^\s*final\s+report\s*[:\-]?.*$',
-]
-BIAS_LINE_REGEXES = [re.compile(p) for p in BIAS_LINE_PATTERNS]
-
-def strip_list_markers(s: str) -> str:
-    lines = (s or "").splitlines()
-    cleaned = []
-    for ln in lines:
-        cleaned.append(LIST_PREFIX_RE.sub("", ln))
-    return "\n".join(cleaned)
-
-def remove_bias_lines(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    lines = s.splitlines()
-    kept = []
-    for ln in lines:
-        if any(rx.search(ln) for rx in BIAS_LINE_REGEXES):
-            continue
-        kept.append(ln)
-    out = "\n".join(kept)
-    out = re.sub(r'\n{3,}', '\n\n', out).strip()
-    return out
-
-def clean_impression(text: str) -> str:
+def _strip_bias_markers(text: str) -> str:
     if not isinstance(text, str):
         return ""
     s = text.strip()
-    # Remove trailing boilerplate
+
+    # Remove any "Impression:" headers to normalize styling
+    s = IMPRESSION_HEADER_RX.sub("", s)
+
+    # Split into lines, drop lines that indicate critical communications
+    lines = []
+    for line in s.splitlines():
+        keep = True
+        for rx in CRITICAL_LINE_REGEXES:
+            if rx.search(line):
+                keep = False
+                break
+        if keep:
+            # Remove leading numbering while keeping the content
+            L = line
+            for rx in LEADING_NUMBERING_REGEXES:
+                L = rx.sub("", L)
+            lines.append(L)
+    s = "\n".join(lines)
+
+    # Scrub trailing boilerplate and contact instructions
     for rx in TRAILING_REGEXES:
-        s = rx.sub("", s).strip()
-    # Debias: remove headings/alerts/signatures, strip list markers
-    s = remove_bias_lines(s)
-    s = strip_list_markers(s)
+        s = rx.sub("", s)
+
     # Normalize whitespace
     s = re.sub(r"[ \t]+\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
-    return s
+    return s.strip()
+
+def clean_impression(text: str) -> str:
+    return _strip_bias_markers(text)
 
 # ---------- Datasets ----------
 
@@ -154,21 +163,53 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_unique_case
+            ON ratings (rater_id, dataset, case_index)
+            """
+        )
         conn.commit()
 
-def save_rating(db_path: str, row: dict) -> None:
+def _get_existing_rating(conn, rater_id: str, dataset: str, case_index: int):
+    row = conn.execute(
+        "SELECT id, choice FROM ratings WHERE rater_id=? AND dataset=? AND case_index=? ORDER BY id DESC LIMIT 1",
+        (rater_id, dataset, case_index),
+    ).fetchone()
+    return row  # (id, choice) or None
+
+def upsert_rating(db_path: str, row: dict) -> None:
     with sqlite3.connect(db_path) as conn:
+        existing = _get_existing_rating(conn, row["rater_id"], row["dataset"], row["case_index"])
         cols = [
             "ts_utc","rater_id","dataset","case_index","ai_is_a","choice",
             "findings_hash","ref_hash","gen_hash","ref_model","gen_model",
             "reward","mean_f1","findings_preview","a_preview","b_preview"
         ]
-        values = [row.get(c) for c in cols]
-        conn.execute(
-            f"INSERT INTO ratings ({', '.join(cols)}) VALUES ({', '.join(['?']*len(cols))})",
-            values
-        )
+        if existing is None:
+            values = [row.get(c) for c in cols]
+            conn.execute(
+                f"INSERT INTO ratings ({', '.join(cols)}) VALUES ({', '.join(['?']*len(cols))})",
+                values
+            )
+        else:
+            rid = existing[0]
+            set_cols = [
+                "ts_utc","ai_is_a","choice",
+                "findings_hash","ref_hash","gen_hash","ref_model","gen_model",
+                "reward","mean_f1","findings_preview","a_preview","b_preview"
+            ]
+            values = [row.get(c) for c in set_cols] + [rid]
+            conn.execute(
+                "UPDATE ratings SET " + ", ".join([f"{c}=?" for c in set_cols]) + " WHERE id=?",
+                values
+            )
         conn.commit()
+
+def get_saved_choice(db_path: str, rater_id: str, dataset: str, case_index: int) -> Optional[str]:
+    with sqlite3.connect(db_path) as conn:
+        row = _get_existing_rating(conn, rater_id, dataset, case_index)
+        return row[1] if row else None
 
 def export_ratings(db_path: str) -> pd.DataFrame:
     with sqlite3.connect(db_path) as conn:
@@ -182,7 +223,6 @@ def setup_authentication():
     If config.yaml doesn't exist, create a default one with 20 demo testers:
       - usernames: tester1..tester20
       - passwords: pass1..pass20 (hashed in config)
-    Replace config.yaml with your real credential set as needed.
     """
     try:
         if not os.path.exists("config.yaml"):
@@ -241,16 +281,10 @@ def load_dataset(path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"CSV missing required columns: {missing}")
     df = df.copy()
-
-    # Clean & debias both impressions
     df["reference_impression_clean"] = df["reference_impression"].apply(clean_impression)
     df["generated_impression_clean"] = df["generated_impression"].apply(clean_impression)
-
-    # Drop empty after cleaning
-    df = df[
-        (df["reference_impression_clean"].astype(str).str.len() > 0) &
-        (df["generated_impression_clean"].astype(str).str.len() > 0)
-    ].reset_index(drop=True)
+    df = df[(df["reference_impression_clean"].str.len() > 0) & (df["generated_impression_clean"].str.len() > 0)]
+    df.reset_index(drop=True, inplace=True)
     return df
 
 # ---------- Streamlit UI ----------
@@ -258,14 +292,13 @@ def load_dataset(path: str) -> pd.DataFrame:
 def ui_header():
     st.title(APP_TITLE)
     st.caption(
-        "Evaluate **four datasets** via tabs. Each tab shows clinical **Findings** and two blinded "
-        "**Impressions (A & B)**—one human and one AI. Click a choice to save, then press **Next ➡️** to move on."
+        "Pick your preferred **Impression (A or B)** per case. "
+        "Your selection is **saved immediately**; press **Next** to continue."
     )
 
 def ui_sidebar(auth_user: Optional[str]):
     st.sidebar.header("Global Setup")
 
-    # Rater ID defaults to authenticated username; user can override if desired.
     rater_id = st.sidebar.text_input("Your User ID (required)", value=(auth_user or ""))
 
     db_path = st.sidebar.text_input("SQLite DB path", value=DB_PATH_DEFAULT)
@@ -296,11 +329,10 @@ def ui_sidebar(auth_user: Optional[str]):
 
 def init_session_state():
     if "datasets_state" not in st.session_state:
-        st.session_state.datasets_state = {}  # per dataset: {df, order (sequential), ptr}
+        st.session_state.datasets_state = {}  # per dataset: {df, order, ptr}
 
 def init_dataset_state(dataset_name: str, df: pd.DataFrame):
-    # Sequential order from first to last for everyone.
-    order = list(range(len(df)))
+    order = list(range(len(df)))  # fixed sequential order
     st.session_state.datasets_state[dataset_name] = {
         "df": df,
         "order": order,
@@ -321,36 +353,6 @@ def ensure_dataset_loaded(cfg, dataset_name: str):
 def preview(txt: str, n=300) -> str:
     s = (txt or "").strip()
     return s[:n] + ("..." if len(s) > n else "")
-
-def record_choice(cfg, dataset_name, case_index, ai_is_a, choice, findings, ref, gen, row, state):
-    """Save the rating ONLY. Do NOT advance pointer; user must press Next."""
-    if not cfg["rater_id"]:
-        st.error("Enter your User ID in the sidebar first.")
-        return
-    db_row = dict(
-        ts_utc=datetime.utcnow().isoformat(timespec="seconds").replace("+00:00","Z"),
-        rater_id=cfg["rater_id"],
-        dataset=dataset_name,
-        case_index=int(case_index),
-        ai_is_a=1 if ai_is_a else 0,
-        choice=choice,
-        findings_hash=text_hash(str(findings)),
-        ref_hash=text_hash(ref),
-        gen_hash=text_hash(gen),
-        ref_model="",  # human reference
-        gen_model=row.get("model_name", ""),
-        reward=float(row["reward"]) if "reward" in row and pd.notna(row["reward"]) else None,
-        mean_f1=float(row["mean_f1_score"]) if "mean_f1_score" in row and pd.notna(row["mean_f1_score"]) else None,
-        findings_preview=preview(findings),
-        a_preview=preview(gen if ai_is_a else ref),
-        b_preview=preview(ref if ai_is_a else gen),
-    )
-    try:
-        init_db(cfg["db_path"])
-        save_rating(cfg["db_path"], db_row)
-        st.success(f"Saved: {choice}. Press **Next ➡️** to continue.")
-    except Exception as e:
-        st.error(f"Failed to save rating: {e}")
 
 def render_dataset_tab(cfg, dataset_name: str):
     st.subheader(f"{dataset_name}")
@@ -375,7 +377,6 @@ def render_dataset_tab(cfg, dataset_name: str):
     with cols_top[2]:
         st.metric("Current index", ptr+1 if order else 0)
 
-    # Reset this dataset
     with cols_top[3]:
         if st.button(f"Reset {dataset_name}", key=f"reset_{dataset_name}"):
             init_dataset_state(dataset_name, df)
@@ -391,7 +392,7 @@ def render_dataset_tab(cfg, dataset_name: str):
     case_index = order[ptr]
     row = df.iloc[case_index].to_dict()
 
-    # A/B mapping (deterministic, no seed UI)
+    # A/B mapping (deterministic)
     ai_is_a = deterministic_ai_is_a(dataset_name, case_index)
 
     ref = row.get("reference_impression_clean", "")
@@ -418,38 +419,84 @@ def render_dataset_tab(cfg, dataset_name: str):
     if cfg["reveal"]:
         st.info(f"Admin view: In **{dataset_name}**, AI is shown as: **{'A' if ai_is_a else 'B'}**.")
 
-    # --- Voting buttons: SAVE ONLY (no advance) ---
-    st.write("#### Choose your preference")
-    btn_cols = st.columns([1,1,1,1])
-    choice_pressed = None
-    with btn_cols[0]:
-        if st.button("A is better", key=f"btnA_{dataset_name}_{case_index}"):
-            choice_pressed = "A"
-    with btn_cols[1]:
-        if st.button("B is better", key=f"btnB_{dataset_name}_{case_index}"):
-            choice_pressed = "B"
-    with btn_cols[2]:
-        if st.button("Tie / No preference", key=f"btnT_{dataset_name}_{case_index}"):
-            choice_pressed = "Tie"
-    with btn_cols[3]:
-        if st.button("Skip", key=f"btnS_{dataset_name}_{case_index}"):
-            choice_pressed = "Skip"
+    # ----- Immediate save on selection -----
+    placeholder = "— Select an answer —"
+    options = [placeholder, "A", "B", "Tie / No preference", "Skip"]
+    choice_key = f"choice_{dataset_name}_{case_index}"
+    saved_msg_key = f"saved_msg_{dataset_name}_{case_index}"
 
-    if choice_pressed is not None:
-        record_choice(
-            cfg, dataset_name, case_index, ai_is_a,
-            choice_pressed, findings, ref, gen, row, state
-        )
+    # Initialize saved message placeholder container
+    if saved_msg_key not in st.session_state:
+        st.session_state[saved_msg_key] = ""
 
-    # Navigation: Previous / Progress / Next (Next advances pointer)
+    # Prepopulate selection from DB if it exists
+    existing_choice = get_saved_choice(cfg["db_path"], cfg["rater_id"], dataset_name, int(case_index)) if cfg["rater_id"] else None
+    default_index = 0
+    if existing_choice == "A":
+        default_index = 1
+    elif existing_choice == "B":
+        default_index = 2
+    elif existing_choice == "Tie":
+        default_index = 3
+    elif existing_choice == "Skip":
+        default_index = 4
+
+    selection = st.radio(
+        "Which impression do you prefer?",
+        options=options,
+        index=default_index,
+        horizontal=True,
+        key=choice_key
+    )
+
+    just_saved = False
+    if selection != placeholder:
+        if not cfg["rater_id"]:
+            st.error("Enter your User ID in the sidebar first.")
+        else:
+            db_row = dict(
+                ts_utc=datetime.utcnow().isoformat(timespec="seconds").replace("+00:00","Z"),
+                rater_id=cfg["rater_id"],
+                dataset=dataset_name,
+                case_index=int(case_index),
+                ai_is_a=1 if ai_is_a else 0,
+                choice={"A":"A","B":"B","Tie / No preference":"Tie","Skip":"Skip"}.get(selection, "Skip"),
+                findings_hash=text_hash(str(findings)),
+                ref_hash=text_hash(ref),
+                gen_hash=text_hash(gen),
+                ref_model="",  # human reference
+                gen_model=row.get("model_name", ""),
+                reward=float(row["reward"]) if "reward" in row and pd.notna(row["reward"]) else None,
+                mean_f1=float(row["mean_f1_score"]) if "mean_f1_score" in row and pd.notna(row["mean_f1_score"]) else None,
+                findings_preview=preview(findings),
+                a_preview=preview(A_text),
+                b_preview=preview(B_text),
+            )
+            try:
+                init_db(cfg["db_path"])
+                upsert_rating(cfg["db_path"], db_row)
+                st.session_state[saved_msg_key] = "✅ Answer saved."
+                just_saved = True
+            except Exception as e:
+                st.error(f"Failed to save rating: {e}")
+
+    if st.session_state.get[saved_msg_key] if callable(st.session_state.get) else st.session_state[saved_msg_key]:
+        st.success(st.session_state[saved_msg_key] if isinstance(st.session_state[saved_msg_key], str) else "✅ Answer saved.")
+
+    # Navigation
     nav1, prog, nav2 = st.columns([1,6,1])
     with nav1:
         if st.button("⬅️ Previous", disabled=(state["ptr"] == 0), key=f"prev_{dataset_name}"):
             state["ptr"] = max(0, state["ptr"] - 1)
+
+    # Progress bar shows position (1-indexed)
     with prog:
         st.progress((state["ptr"] + 1) / max(1, len(order)))
+
     with nav2:
-        if st.button("Next ➡️", disabled=(state["ptr"] >= len(order) - 1), key=f"next_{dataset_name}"):
+        # Only enable Next if an answer exists (DB) for this case
+        has_answer = (existing_choice is not None) or just_saved
+        if st.button("Next ➡️", disabled=(state["ptr"] >= len(order) - 1) or (not has_answer), key=f"next_{dataset_name}"):
             state["ptr"] = min(len(order) - 1, state["ptr"] + 1)
 
 def main():
