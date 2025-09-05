@@ -4,11 +4,13 @@
 # each with its own sequential case order & independent progress pointer, sharing ONE SQLite DB.
 #
 # CHANGES (2025-09-05):
-# - FIX: Replaced incorrect `st.session_state.get[...]` with proper call `st.session_state.get(key, "")`.
-# - Single-click save: choosing A/B/Tie/Skip immediately UPSERTs to SQLite; press Next to advance.
-# - Next is disabled until an answer is saved for the current case.
-# - Bias scrubbing: remove numbering, "Impression:" headers, and lines indicating critical/urgent comms.
-# - Read-only impression boxes (disabled text areas) so raters can’t edit the text.
+# - ✅ Fix TypeError (bad st.session_state.get usage).
+# - ✅ Auto-advance: selecting A/B/Tie/Skip immediately saves and jumps to the next case.
+# - ✅ Remove "Previous" and "Next" buttons (flow is strictly forward).
+# - ✅ Show toast: “Answer saved — moving to next case…”.
+# - ✅ Bias scrubbing: remove list numbering, “Impression:” headers, and critical/notification lines.
+# - ✅ Read-only impression boxes.
+# - ✅ Faster per-case loads via st.cache_data for CSV/cleaning; SQLite WAL tweaks for small writes.
 #
 # How to run:
 #   pip install streamlit pandas streamlit-authenticator pyyaml
@@ -36,10 +38,15 @@ import random
 import sqlite3
 from datetime import datetime
 import re
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import pandas as pd
 import streamlit as st
+
+import json
+import uuid
+import logging
+import time
 
 import streamlit_authenticator as stauth
 import yaml
@@ -59,9 +66,10 @@ CRITICAL_LINE_PATTERNS = [
 ]
 
 LEADING_NUMBERING_PATTERNS = [
-    r'(?im)^\s*\(?\d+\)?[.)-]\s+',
-    r'(?im)^\s*[ivxlcdmIVXLCDM]+\)\s+',
-    r'(?im)^\s*[a-zA-Z]\)\s+',
+    r'(?im)^\s*\(?\d+\)?[.)-]\s+',          # 1.  1)  (1)  1-
+    r'(?im)^\s*[ivxlcdmIVXLCDM]+\)\s+',     # i)  ii)  IV)
+    r'(?im)^\s*[a-zA-Z]\)\s+',              # a)  b)  A)
+    r'(?im)^\s*[-*•]\s+',                   # bullets: -, *, •
 ]
 
 TRAILING_PATTERNS = [
@@ -82,18 +90,26 @@ def _strip_bias_markers(text: str) -> str:
     if not isinstance(text, str):
         return ""
     s = text.strip()
+
+    # Remove any "Impression:" headers to normalize styling
     s = IMPRESSION_HEADER_RX.sub("", s)
-    lines = []
+
+    # Drop lines that look like critical/notification statements; strip list numbering/bullets
+    out_lines = []
     for line in s.splitlines():
         if any(rx.search(line) for rx in CRITICAL_LINE_REGEXES):
             continue
         L = line
         for rx in LEADING_NUMBERING_REGEXES:
             L = rx.sub("", L)
-        lines.append(L)
-    s = "\n".join(lines)
+        out_lines.append(L)
+    s = "\n".join(out_lines)
+
+    # Scrub trailing boilerplate
     for rx in TRAILING_REGEXES:
         s = rx.sub("", s)
+
+    # Normalize whitespace
     s = re.sub(r"[ \t]+\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
@@ -112,11 +128,22 @@ DEFAULT_DATASETS = {
 
 REQUIRED_COLUMNS = {"Findings", "reference_impression", "generated_impression"}
 
-# ---------- DB ----------
+# ---------- DB helpers ----------
+
+def open_db(db_path: str):
+    """Open a short-lived SQLite connection with WAL settings for small, frequent writes."""
+    conn = sqlite3.connect(db_path, timeout=5)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=3000;")
+    except Exception:
+        pass
+    return conn
 
 def init_db(db_path: str) -> None:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
+    with open_db(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ratings (
@@ -155,14 +182,14 @@ def _get_existing_rating(conn, rater_id: str, dataset: str, case_index: int):
     ).fetchone()
 
 def upsert_rating(db_path: str, row: dict) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with open_db(db_path) as conn:
         existing = _get_existing_rating(conn, row["rater_id"], row["dataset"], row["case_index"])
-        cols = [
-            "ts_utc","rater_id","dataset","case_index","ai_is_a","choice",
-            "findings_hash","ref_hash","gen_hash","ref_model","gen_model",
-            "reward","mean_f1","findings_preview","a_preview","b_preview"
-        ]
         if existing is None:
+            cols = [
+                "ts_utc","rater_id","dataset","case_index","ai_is_a","choice",
+                "findings_hash","ref_hash","gen_hash","ref_model","gen_model",
+                "reward","mean_f1","findings_preview","a_preview","b_preview"
+            ]
             conn.execute(
                 f"INSERT INTO ratings ({', '.join(cols)}) VALUES ({', '.join(['?']*len(cols))})",
                 [row.get(c) for c in cols]
@@ -181,44 +208,45 @@ def upsert_rating(db_path: str, row: dict) -> None:
         conn.commit()
 
 def get_saved_choice(db_path: str, rater_id: str, dataset: str, case_index: int) -> Optional[str]:
-    with sqlite3.connect(db_path) as conn:
+    with open_db(db_path) as conn:
         row = _get_existing_rating(conn, rater_id, dataset, case_index)
         return row[1] if row else None
 
 def export_ratings(db_path: str) -> pd.DataFrame:
-    with sqlite3.connect(db_path) as conn:
+    with open_db(db_path) as conn:
         return pd.read_sql_query("SELECT * FROM ratings ORDER BY id ASC", conn)
 
 # ---------- Authentication ----------
 
-def setup_authentication():
-    """
-    streamlit-authenticator with YAML config.
-    If config.yaml doesn't exist, create 20 demo users tester1..tester20 / pass1..pass20 (hashed).
-    """
-    try:
-        if not os.path.exists("config.yaml"):
-            plain_passwords = [f"pass{i+1}" for i in range(20)]
-            hashed_passwords = Hasher(plain_passwords).generate()
-            credentials_dict = {}
-            for i in range(20):
-                username = f"tester{i+1}"
-                credentials_dict[username] = {
-                    "email": f"{username}@example.com",
-                    "name": f"Test User {i+1}",
-                    "password": hashed_passwords[i],
-                }
-            config = {
-                "credentials": {"usernames": credentials_dict},
-                "cookie": {"expiry_days": 180, "key": "your_cookie_key", "name": "auth_cookie"},
-                "preauthorized": [],
+@st.cache_data(show_spinner=False)
+def _load_auth_config() -> Dict[str, Any]:
+    """Cache reading/creating the config.yaml to avoid disk I/O on every rerun."""
+    if not os.path.exists("config.yaml"):
+        plain_passwords = [f"pass{i+1}" for i in range(20)]
+        hashed_passwords = Hasher(plain_passwords).generate()
+        credentials_dict = {}
+        for i in range(20):
+            username = f"tester{i+1}"
+            credentials_dict[username] = {
+                "email": f"{username}@example.com",
+                "name": f"Test User {i+1}",
+                "password": hashed_passwords[i],
             }
-            with open("config.yaml", "w") as f:
-                yaml.dump(config, f)
+        config = {
+            "credentials": {"usernames": credentials_dict},
+            "cookie": {"expiry_days": 180, "key": "your_cookie_key", "name": "auth_cookie"},
+            "preauthorized": [],
+        }
+        with open("config.yaml", "w") as f:
+            yaml.dump(config, f)
 
-        with open("config.yaml", "r", encoding="utf-8") as f:
-            config = yaml.load(f, Loader=SafeLoader)
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        return yaml.load(f, Loader=SafeLoader)
 
+def setup_authentication():
+    """Create the authenticator from cached YAML config."""
+    try:
+        config = _load_auth_config()
         return stauth.Authenticate(
             credentials=config["credentials"],
             cookie_name=config["cookie"]["name"],
@@ -236,12 +264,15 @@ def text_hash(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
 
 def deterministic_ai_is_a(dataset_name: str, case_index: int) -> bool:
+    """Deterministic A/B mapping (no seed UI)."""
     seed_src = f"{dataset_name}|{case_index}|abmap_v1"
     seed_int = int(hashlib.sha256(seed_src.encode("utf-8")).hexdigest()[:8], 16)
     rng = random.Random(seed_int ^ 0x9E3779B1)
     return rng.random() < 0.5
 
+@st.cache_data(show_spinner=False)
 def load_dataset(path: str) -> pd.DataFrame:
+    """Read CSV and pre-clean impressions (cached)."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"CSV not found: {path}")
     df = pd.read_csv(path)
@@ -255,13 +286,11 @@ def load_dataset(path: str) -> pd.DataFrame:
     df.reset_index(drop=True, inplace=True)
     return df
 
-# ---------- Streamlit UI ----------
-
 def ui_header():
     st.title(APP_TITLE)
     st.caption(
-        "Pick your preferred **Impression (A or B)** per case. "
-        "Your selection is **saved immediately**; press **Next** to continue."
+        "Select your preferred **Impression (A or B)** per case. "
+        "Your answer is **saved immediately** and the app **auto-advances** to the next case."
     )
 
 def ui_sidebar(auth_user: Optional[str]):
@@ -280,6 +309,9 @@ def ui_sidebar(auth_user: Optional[str]):
 
     st.sidebar.divider()
     start_all = st.sidebar.button("Start / Reset ALL datasets", type="primary")
+    if st.sidebar.button("Clear data cache (CSV)"):
+        load_dataset.clear()
+        st.sidebar.success("Cleared cached datasets.")
 
     st.sidebar.divider()
     admin_code = st.sidebar.text_input("Admin code (optional)", value="")
@@ -306,6 +338,7 @@ def init_dataset_state(dataset_name: str, df: pd.DataFrame):
         "order": order,
         "ptr": 0,
         "n_cases": len(order),
+        "last_saved_msg": "",
     }
 
 def get_dataset_state(dataset_name: str):
@@ -322,9 +355,60 @@ def preview(txt: str, n=300) -> str:
     s = (txt or "").strip()
     return s[:n] + ("..." if len(s) > n else "")
 
+# ----- Callback for immediate save + auto-advance -----
+
+def _on_choice_change(dataset_name: str, case_index: int, choice_key: str, cfg: Dict[str, Any],
+                      ai_is_a: bool, findings: str, ref: str, gen: str, row: Dict[str, Any]):
+    selection = st.session_state.get(choice_key, "")
+    if selection not in ("A", "B", "Tie / No preference", "Skip"):
+        return
+
+    if not cfg["rater_id"]:
+        st.toast("Enter your User ID in the sidebar first.", icon="⚠️")
+        return
+
+    A_text = gen if ai_is_a else ref
+    B_text = ref if ai_is_a else gen
+
+    db_row = dict(
+        ts_utc=datetime.utcnow().isoformat(timespec="seconds").replace("+00:00","Z"),
+        rater_id=cfg["rater_id"],
+        dataset=dataset_name,
+        case_index=int(case_index),
+        ai_is_a=1 if ai_is_a else 0,
+        choice={"A":"A","B":"B","Tie / No preference":"Tie","Skip":"Skip"}.get(selection, "Skip"),
+        findings_hash=text_hash(str(findings)),
+        ref_hash=text_hash(ref),
+        gen_hash=text_hash(gen),
+        ref_model="",  # human reference
+        gen_model=row.get("model_name", ""),
+        reward=float(row["reward"]) if "reward" in row and pd.notna(row["reward"]) else None,
+        mean_f1=float(row["mean_f1_score"]) if "mean_f1_score" in row and pd.notna(row["mean_f1_score"]) else None,
+        findings_preview=preview(findings),
+        a_preview=preview(A_text),
+        b_preview=preview(B_text),
+    )
+
+    try:
+        init_db(cfg["db_path"])
+        upsert_rating(cfg["db_path"], db_row)
+        # Advance pointer
+        state = get_dataset_state(dataset_name)
+        if state is not None:
+            if state["ptr"] < len(state["order"]) - 1:
+                state["ptr"] += 1
+                st.toast("✅ Answer saved — moving to next case…")
+                st.experimental_rerun()
+            else:
+                state["last_saved_msg"] = "✅ Answer saved — end of dataset."
+                st.experimental_rerun()
+    except Exception as e:
+        st.toast(f"Failed to save rating: {e}", icon="❌")
+
+# ---------- Per-dataset UI ----------
+
 def render_dataset_tab(cfg, dataset_name: str):
     st.subheader(f"{dataset_name}")
-    # Lazy load this dataset if needed
     try:
         ensure_dataset_loaded(cfg, dataset_name)
     except Exception as e:
@@ -336,22 +420,20 @@ def render_dataset_tab(cfg, dataset_name: str):
     order = state["order"]
     ptr = state["ptr"]
 
-    # Controls row
-    cols_top = st.columns([1,1,1,2])
+    if state.get("last_saved_msg"):
+        st.success(state["last_saved_msg"])
+        state["last_saved_msg"] = ""
+
+    # Header metrics
+    cols_top = st.columns([1,1,2])
     with cols_top[0]:
         st.metric("Total cases", len(df))
     with cols_top[1]:
-        st.metric("In session", state["n_cases"])
+        st.metric("Current", ptr+1 if order else 0)
     with cols_top[2]:
-        st.metric("Current index", ptr+1 if order else 0)
-
-    with cols_top[3]:
         if st.button(f"Reset {dataset_name}", key=f"reset_{dataset_name}"):
             init_dataset_state(dataset_name, df)
             st.success("Reset complete.")
-            state = get_dataset_state(dataset_name)
-            order = state["order"]
-            ptr = state["ptr"]
 
     if not order:
         st.warning("No cases available in this dataset.")
@@ -370,6 +452,8 @@ def render_dataset_tab(cfg, dataset_name: str):
     A_text = gen if ai_is_a else ref
     B_text = ref if ai_is_a else gen
 
+    st.info("Select an answer below. It will save and automatically move to the next case.")
+
     with st.expander("Clinical Findings", expanded=True):
         st.write(findings)
 
@@ -378,21 +462,21 @@ def render_dataset_tab(cfg, dataset_name: str):
     with colA:
         st.markdown("**Impression A**")
         st.text_area(" ", A_text, height=260, label_visibility="collapsed",
-                     key=f"{dataset_name}_A_{case_index}", disabled=True)  # disabled per docs
+                     key=f"{dataset_name}_A_{case_index}", disabled=True)
     with colB:
         st.markdown("**Impression B**")
         st.text_area("  ", B_text, height=260, label_visibility="collapsed",
                      key=f"{dataset_name}_B_{case_index}", disabled=True)
 
-    # ---- Immediate save on selection ----
+    if cfg["reveal"]:
+        st.info(f"Admin view: In **{dataset_name}**, AI is shown as: **{'A' if ai_is_a else 'B'}**.")
+
+    # ----- Selection (auto-save + auto-advance) -----
     placeholder = "— Select an answer —"
     options = [placeholder, "A", "B", "Tie / No preference", "Skip"]
     choice_key = f"choice_{dataset_name}_{case_index}"
-    saved_msg_key = f"saved_msg_{dataset_name}_{case_index}"
 
-    if saved_msg_key not in st.session_state:
-        st.session_state[saved_msg_key] = ""
-
+    # Prepopulate from DB (if any) — usually empty since flow is sequential forward
     existing_choice = get_saved_choice(cfg["db_path"], cfg["rater_id"], dataset_name, int(case_index)) if cfg["rater_id"] else None
     default_index = 0
     if existing_choice == "A":
@@ -404,68 +488,20 @@ def render_dataset_tab(cfg, dataset_name: str):
     elif existing_choice == "Skip":
         default_index = 4
 
-    selection = st.radio(
+    st.radio(
         "Which impression do you prefer?",
         options=options,
         index=default_index,
         horizontal=True,
-        key=choice_key
+        key=choice_key,
+        on_change=_on_choice_change,
+        args=(dataset_name, case_index, choice_key, cfg, ai_is_a, findings, ref, gen, row),
     )
 
-    just_saved = False
-    if selection != placeholder:
-        if not cfg["rater_id"]:
-            st.error("Enter your User ID in the sidebar first.")
-        else:
-            mapped = {"A":"A","B":"B","Tie / No preference":"Tie","Skip":"Skip"}[selection]
-            # Avoid redundant writes: only save if it changed
-            if existing_choice != mapped:
-                db_row = dict(
-                    ts_utc=datetime.utcnow().isoformat(timespec="seconds").replace("+00:00","Z"),
-                    rater_id=cfg["rater_id"],
-                    dataset=dataset_name,
-                    case_index=int(case_index),
-                    ai_is_a=1 if ai_is_a else 0,
-                    choice=mapped,
-                    findings_hash=text_hash(str(findings)),
-                    ref_hash=text_hash(ref),
-                    gen_hash=text_hash(gen),
-                    ref_model="",  # human reference
-                    gen_model=row.get("model_name", ""),
-                    reward=float(row["reward"]) if "reward" in row and pd.notna(row["reward"]) else None,
-                    mean_f1=float(row["mean_f1_score"]) if "mean_f1_score" in row and pd.notna(row["mean_f1_score"]) else None,
-                    findings_preview=preview(findings),
-                    a_preview=preview(A_text),
-                    b_preview=preview(B_text),
-                )
-                try:
-                    init_db(cfg["db_path"])
-                    upsert_rating(cfg["db_path"], db_row)
-                    st.session_state[saved_msg_key] = "✅ Answer saved."
-                    just_saved = True
-                except Exception as e:
-                    st.error(f"Failed to save rating: {e}")
+    # Progress bar (1-indexed)
+    st.progress((state["ptr"] + 1) / max(1, len(order)))
 
-    # ✅ FIXED: use .get() call, not subscription
-    msg = st.session_state.get(saved_msg_key, "")
-    if msg:
-        st.success(msg)
-
-    # Navigation
-    nav1, prog, nav2 = st.columns([1,6,1])
-    with nav1:
-        if st.button("⬅️ Previous", disabled=(state["ptr"] == 0), key=f"prev_{dataset_name}"):
-            state["ptr"] = max(0, state["ptr"] - 1)
-
-    with prog:
-        st.progress((state["ptr"] + 1) / max(1, len(order)))
-
-    with nav2:
-        has_answer = (existing_choice is not None) or just_saved
-        if st.button("Next ➡️", disabled=(state["ptr"] >= len(order) - 1) or (not has_answer), key=f"next_{dataset_name}"):
-            state["ptr"] = min(len(order) - 1, state["ptr"] + 1)
-            # Clear per-case UI message when moving forward
-            st.session_state[saved_msg_key] = ""
+# ---------- Main ----------
 
 def main():
     # --- Auth barrier ---
@@ -488,7 +524,7 @@ def main():
     cfg = ui_sidebar(auth_user=username)
     init_session_state()
 
-    # Init DB early so export works even before first save
+    # Initialize DB early
     try:
         if cfg["db_path"]:
             init_db(cfg["db_path"])
@@ -529,7 +565,8 @@ def main():
         except Exception as e:
             st.error(f"Export failed: {e}")
 
-    st.caption("Each tab uses its own sequential case order and progress; all ratings go to the same SQLite database.")
+    st.caption("Each tab is an independent GUI with its own sequential order and progress. "
+               "All ratings go to the same SQLite database for unified analysis.")
 
 if __name__ == "__main__":
     main()
